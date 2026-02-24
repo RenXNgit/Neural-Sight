@@ -119,8 +119,11 @@
         </div>
 
         <!-- 视频流（用于调试和演示） -->
-        <div class="video-container">
-            <img id="video_feed" src="/video_feed" alt="Video Stream">
+        <div class="flex justify-center items-center" style="height: 100vh;">
+            <div style="position:relative; width:640px; height:480px;">
+                <video id="video" autoplay playsinline style="width:640px;height:480px;transform:scaleX(-1);"></video>
+                <canvas id="overlay" style="position:absolute;left:0;top:0;width:640px;height:480px;z-index:2;pointer-events:none;"></canvas>
+            </div>
         </div>
 
         <!-- 指令显示面板 -->
