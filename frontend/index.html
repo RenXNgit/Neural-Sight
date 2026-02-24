@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SmartReach Accessibility - Voice-Guided Grasping</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        .debug-panel {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: rgba(0, 0, 0, 0.8);
+            color: #00ff00;
+            padding: 16px;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            max-width: 300px;
+            z-index: 1000;
+        }
+        .video-container {
+            position: relative;
+            width: 100%;
+            max-width: 800px;
+            margin: 0 auto;
+            background: #000;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        #video_feed {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+        .instruction-display {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 32px;
+            border-radius: 12px;
+            text-align: center;
+            margin-top: 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            min-height: 120px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .instruction-text {
+            font-size: 48px;
+            font-weight: bold;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+            animation: pulse 1s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.8; }
+        }
+        .status-indicator {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            margin-right: 8px;
+            animation: blink 1s infinite;
+        }
+        .status-indicator.active {
+            background: #10b981;
+        }
+        .status-indicator.inactive {
+            background: #ef4444;
+        }
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .info-panel {
+            background: white;
+            padding: 24px;
+            border-radius: 12px;
+            margin-top: 20px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+        .info-title {
+            font-size: 20px;
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 12px;
+        }
+        .info-text {
+            color: #666;
+            line-height: 1.6;
+            font-size: 14px;
+        }
+        .accessibility-badge {
+            display: inline-block;
+            background: #10b981;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            margin-top: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container mx-auto px-4 py-8">
+        <div class="text-center mb-8">
+            <h1 class="text-4xl font-bold text-white mb-2">SmartReach</h1>
+            <p class="text-white text-lg opacity-90">Accessibility Edition - Voice-Guided Grasping Assistant</p>
+            <span class="accessibility-badge">♿ Accessibility First</span>
+        </div>
+
+        <!-- 视频流（用于调试和演示） -->
+        <div class="video-container">
+            <img id="video_feed" src="/video_feed" alt="Video Stream">
+        </div>
+
+        <!-- 指令显示面板 -->
+        <div class="instruction-display">
+            <div class="instruction-text" id="instruction">Initializing...</div>
+        </div>
+
+        <!-- 系统信息面板 -->
+        <div class="info-panel">
+            <div class="info-title">
+                <span class="status-indicator active" id="status_indicator"></span>
+                System Status
+            </div>
+            <div class="info-text">
+                <p><strong>Mode:</strong> Accessibility (Voice-Controlled)</p>
+                <p><strong>Target:</strong> <span id="target_label">bottle</span></p>
+                <p><strong>Hand Detected:</strong> <span id="hand_status">No</span></p>
+                <p><strong>Target Detected:</strong> <span id="target_status">No</span></p>
+                <p><strong>FPS:</strong> <span id="fps">0</span></p>
+                <p><strong>Distance Ratio:</strong> <span id="distance_ratio">0%</span></p>
+            </div>
+            <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #ddd;">
+                <p class="info-text"><strong>Voice Commands:</strong></p>
+                <p class="info-text" style="font-size: 12px; color: #999;">
+                    • "Find bottle" / "Find cup" / "Find phone"<br>
+                    • "Start" / "Stop" / "Pause"
+                </p>
+            </div>
+        </div>
+
+        <!-- 使用指南 -->
+        <div class="info-panel" style="margin-top: 20px;">
+            <div class="info-title">How to Use (无障碍使用指南)</div>
+            <div class="info-text">
+                <p><strong>1. 启动系统</strong></p>
+                <p style="font-size: 12px; color: #999; margin-bottom: 12px;">
+                    系统启动后会自动进入监听状态。您可以通过麦克风说出语音命令。
+                </p>
+                <p><strong>2. 指定目标物体</strong></p>
+                <p style="font-size: 12px; color: #999; margin-bottom: 12px;">
+                    说 "Find bottle" 或 "Find cup" 来指定要抓取的物体。
+                </p>
+                <p><strong>3. 跟随语音指导</strong></p>
+                <p style="font-size: 12px; color: #999; margin-bottom: 12px;">
+                    系统会不断播报方向指令（"Left", "Right", "Forward" 等）。
+                    距离越近，播报频率越快，语速越快（类似倒车雷达）。
+                </p>
+                <p><strong>4. 完成抓取</strong></p>
+                <p style="font-size: 12px; color: #999;">
+                    当系统说 "Stop. Grasp now" 时，您可以伸手抓取物体。
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <!-- 调试面板 -->
+    <div class="debug-panel">
+        <div>SmartReach Accessibility</div>
+        <div style="margin-top: 8px; border-top: 1px solid #00ff00; padding-top: 8px;">
+            <div id="debug_instruction">Instruction: -</div>
+            <div id="debug_target">Target: -</div>
+            <div id="debug_hand">Hand: -</div>
+            <div id="debug_fps">FPS: 0</div>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
