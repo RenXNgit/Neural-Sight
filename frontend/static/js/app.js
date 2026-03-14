@@ -4,6 +4,16 @@ let recog, recogActive = false;
 let lastVoiceTime = Date.now();
 let listenTimeout = null;
 let handTrail = [];
+let currentTarget = "";
+let isSpeaking = false;
+let lastSpokenText = "";
+let lastSpokenAt = 0;
+let lastFoundSpokenAt = 0;
+let welcomePromptPlayed = false;
+
+const SPEAK_COOLDOWN_MS = 1200;
+const FOUND_ANNOUNCE_COOLDOWN_MS = 8000;
+const GUIDANCE_REPEAT_MS = 2000;
 
 
 
@@ -68,6 +78,7 @@ async function sendFrame() {
         updateInstruction(data.instruction);
     } catch (e) {
         speak("推理失败");
+        console.error("具体的推理报错信息:", e); // 把错误打印到浏览器控制台
     } finally {
         sending = false;
     }
@@ -118,21 +129,103 @@ function drawDetections(data) {
 }
 
 function updateInstruction(instr) {
-    if (instr && instr !== lastInstruction) {
-        speak(instr);
-        lastInstruction = instr;
+    const text = normalizeText(instr);
+    if (!text) {
+        const el = document.getElementById('instruction');
+        if (el) el.textContent = instr || '';
+        return;
+    }
+
+    // 一轮任务结束后清空前端目标缓存，允许下一轮继续选择同一目标。
+    if (text.includes('任务完成')) {
+        currentTarget = "";
+    }
+
+    if (shouldSpeakInstruction(text)) {
+        speak(text);
+        lastInstruction = text;
     }
     const el = document.getElementById('instruction');
     if (el) el.textContent = instr;
 }
 
+function normalizeText(text) {
+    return (text || '').replace(/\s+/g, ' ').trim();
+}
+
+function isFoundInstruction(text) {
+    const compact = text.replace(/\s+/g, '').toLowerCase();
+    return compact.includes('找到') || compact.includes('已发现') || compact.includes('found');
+}
+
+function isGuidanceInstruction(text) {
+    return text.includes('手向')
+        || text.includes('向前一点')
+        || text.includes('继续向前一点')
+        || text.includes('稍微后退一点');
+}
+
+function shouldSpeakInstruction(text) {
+    const now = Date.now();
+    if (text === lastInstruction) {
+        // 引导类指令允许按固定频率重复播报，避免用户只听到一次。
+        if (isGuidanceInstruction(text) && now - lastSpokenAt >= GUIDANCE_REPEAT_MS) {
+            return true;
+        }
+        return false;
+    }
+
+    if (isFoundInstruction(text)) {
+        if (now - lastFoundSpokenAt < FOUND_ANNOUNCE_COOLDOWN_MS) {
+            return false;
+        }
+        lastFoundSpokenAt = now;
+    }
+
+    if (now - lastSpokenAt < SPEAK_COOLDOWN_MS) {
+        return false;
+    }
+
+    return true;
+}
+
 // 语音播报
-function speak(text) {
+function speak(text, options = {}) {
+    const { force = false, cooldownMs = SPEAK_COOLDOWN_MS } = options;
     if (!window.speechSynthesis) return;
-    const utter = new SpeechSynthesisUtterance(text);
+    const normalized = normalizeText(text);
+    if (!normalized) return;
+
+    const now = Date.now();
+    if (!force) {
+        if (normalized === lastSpokenText && now - lastSpokenAt < cooldownMs) return;
+        if (now - lastSpokenAt < cooldownMs) return;
+    }
+
+    const utter = new SpeechSynthesisUtterance(normalized);
     utter.lang = 'zh-CN';
+    utter.onstart = () => {
+        isSpeaking = true;
+    };
+    utter.onend = () => {
+        isSpeaking = false;
+    };
+    utter.onerror = () => {
+        isSpeaking = false;
+    };
+
+    // 队列里只保留最新一句，避免连续积压造成“循环播报”错觉。
     window.speechSynthesis.cancel();
     window.speechSynthesis.speak(utter);
+    lastSpokenText = normalized;
+    lastSpokenAt = now;
+}
+
+function playWelcomePrompt(force = false) {
+    const welcome = "请问您需要什么？";
+    if (!force && welcomePromptPlayed) return;
+    speak(welcome, { force: true, cooldownMs: 300 });
+    welcomePromptPlayed = true;
 }
 
 // 智能语音输入（持续监听，交互友好）
@@ -145,27 +238,26 @@ function setupVoiceInput() {
     recog.interimResults = false;
 
     recog.onresult = function(event) {
+        if (isSpeaking) return;
         lastVoiceTime = Date.now();
         clearTimeout(listenTimeout);
         let found = false;
-        for (let i = 0; i < event.results.length; i++) {
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+            if (!event.results[i].isFinal) continue;
             const text = event.results[i][0].transcript.trim();
             if (text.includes("瓶")) {
-                sendTarget("bottle");
-                speak("已收到您的指令，目标切换为瓶子");
+                setTargetWithFeedback("bottle", "正在寻找瓶子。");
                 found = true;
             } else if (text.includes("杯")) {
-                sendTarget("cup");
-                speak("已收到您的指令，目标切换为杯子");
+                setTargetWithFeedback("cup", "正在寻找杯子。");
                 found = true;
             } else if (text.includes("手机")) {
-                sendTarget("phone");
-                speak("已收到您的指令，目标切换为手机");
+                setTargetWithFeedback("phone", "正在寻找手机。");
                 found = true;
             }
         }
         if (!found) {
-            speak("未能识别您的语音，请再说一次");
+            speak("未能识别您的语音，请再说一次", { cooldownMs: 5000 });
         }
         restartListenTimeout();
     };
@@ -173,7 +265,7 @@ function setupVoiceInput() {
     recog.onerror = function(event) {
         // 只播报一次错误
         if (event.error === "no-speech") {
-            speak("未听到您的指令，请再试一次");
+            speak("未听到您的指令，请再试一次", { cooldownMs: 10000 });
         }
         setTimeout(() => recog.start(), 1000);
         restartListenTimeout();
@@ -185,7 +277,6 @@ function setupVoiceInput() {
     };
 
     recog.start();
-    speak("语音识别已开启，请说出目标");
     restartListenTimeout();
 }
 
@@ -193,8 +284,18 @@ function setupVoiceInput() {
 function restartListenTimeout() {
     clearTimeout(listenTimeout);
     listenTimeout = setTimeout(() => {
-        speak("未听到您的指令，请再试一次");
+        if (!isSpeaking) {
+            speak("未听到您的指令，请再试一次", { cooldownMs: 10000 });
+        }
     }, 10000);
+}
+
+function setTargetWithFeedback(target, feedback) {
+    // 同一目标不重复下发，防止识别到回声后不断触发。
+    if (target === currentTarget) return;
+    currentTarget = target;
+    sendTarget(target);
+    speak(feedback, { force: true });
 }
 
 function sendTarget(target) {
@@ -208,5 +309,16 @@ function sendTarget(target) {
 document.addEventListener('DOMContentLoaded', function() {
     setupCamera();
     setInterval(sendFrame, 500); // 0.5秒一帧，不卡
+    setTimeout(() => playWelcomePrompt(), 400);
+
+    // 某些浏览器会拦截首次自动播报，用户首次交互后补播一次。
+    const replayOnFirstGesture = () => {
+        const now = Date.now();
+        if (lastSpokenText !== "请问您需要什么？" || now - lastSpokenAt > 4000) {
+            playWelcomePrompt(true);
+        }
+    };
+    document.addEventListener('click', replayOnFirstGesture, { once: true });
+
     setupVoiceInput();
 });

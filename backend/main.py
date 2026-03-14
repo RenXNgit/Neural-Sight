@@ -2,6 +2,7 @@ import os
 import time
 import threading
 import logging
+from contextlib import contextmanager
 from typing import List, Dict, Any, Optional
 
 import cv2
@@ -12,6 +13,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from ultralytics import YOLO
+try:
+    import torch
+except Exception:
+    torch = None
 
 # 可选依赖（语音/TTS）
 try:
@@ -36,6 +41,23 @@ ENABLE_LOCAL_CAM = os.getenv("ENABLE_LOCAL_CAM", "0") == "1"
 ENABLE_LOCAL_VOICE = os.getenv("ENABLE_LOCAL_VOICE", "0") == "1"
 ENABLE_TTS = os.getenv("ENABLE_TTS", "0") == "1"
 
+SEARCH_TIMEOUT_SEC = 20
+HAND_TIMEOUT_SEC = 10
+COMPLETE_HOLD_SEC = 1.2
+COMPLETE_DIST_THRESHOLD = 0.08
+TARGET_MOVE_COMPLETE_THRESHOLD = 0.12
+GRASP_ALIGN_THRESHOLD = 0.12
+
+TARGET_CN_MAP = {
+    "bottle": "瓶子",
+    "cup": "杯子",
+    "phone": "手机",
+}
+
+
+def target_to_cn(label: str) -> str:
+    return TARGET_CN_MAP.get(label, label)
+
 # ============ FastAPI 应用初始化 ============
 app = FastAPI(title="SmartReach Accessibility", version="2.0.0")
 app.add_middleware(
@@ -48,7 +70,33 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory="../frontend/static"), name="static")
 
 # ============ 模型与手部检测 ============
-YOLO_MODEL = YOLO(MODEL_PATH)
+@contextmanager
+def temporary_torch_load_patch_for_yolo():
+    if torch is None:
+        yield
+        return
+
+    original_load = torch.load
+
+    def _patched_torch_load(*args, **kwargs):
+        # Trust local model file in this project and keep legacy behavior for YOLO checkpoint loading.
+        kwargs.setdefault("weights_only", False)
+        return original_load(*args, **kwargs)
+
+    torch.load = _patched_torch_load
+    try:
+        yield
+    finally:
+        torch.load = original_load
+
+
+def load_yolo_model(model_path: str):
+    # PyTorch 2.6+ changed torch.load defaults and can break older YOLO checkpoints.
+    with temporary_torch_load_patch_for_yolo():
+        return YOLO(model_path)
+
+
+YOLO_MODEL = load_yolo_model(MODEL_PATH)
 MP_HANDS = mp.solutions.hands
 HANDS = MP_HANDS.Hands(max_num_hands=1, min_detection_confidence=0.7)
 MP_DRAW = mp.solutions.drawing_utils
@@ -56,14 +104,21 @@ MP_DRAW = mp.solutions.drawing_utils
 # ============ 系统状态 ============
 class SystemState:
     def __init__(self):
-        self.current_instruction = "System initializing..."
+        self.current_instruction = "请问您需要什么？"
         self.target_detected = False
         self.hand_detected = False
         self.confidence = 0.0
         self.distance_ratio = 0.0
         self.last_infer_ms = 0.0
         self.target_label = TARGET_LABEL_DEFAULT
+        self.target_selected = False
         self.last_command = None
+        self.phase = "idle"
+        self.search_started_at = time.time()
+        self.target_seen_at = None
+        self.grab_candidate_since = None
+        self.last_target_center = None
+        self.completed_until = 0.0
 
 state = SystemState()
 
@@ -105,40 +160,43 @@ def speak_async(text: str):
     threading.Thread(target=_run, daemon=True).start()
 
 # ============ 核心指令生成 ============
-def generate_accessible_instruction(hand_info, target_info, h, w):
-    if not target_info:
-        return "Searching for target", 0.0
-    if not hand_info:
-        return "Hand not detected", 0.0
-
-    hx, hy = hand_info["norm_center"]
+def generate_realtime_guidance(hand_info, target_info, h, w):
+    hx, hy = hand_info["x"] / w, hand_info["y"] / h
     tx, ty = target_info["center"][0] / w, target_info["center"][1] / h
     dx, dy = hx - tx, hy - ty
+    norm_dist = float(np.hypot(dx, dy))
     distance_ratio = target_info["area"]
 
-    threshold = 0.1
-    instr = []
+    threshold = 0.08
+    moves = []
+
+    # 手在目标后方时，中心可能已对齐但视觉上无明显位移，直接进入可抓取提示。
+    if abs(dx) <= GRASP_ALIGN_THRESHOLD and abs(dy) <= GRASP_ALIGN_THRESHOLD and distance_ratio >= 0.02:
+        return "可以抓取", distance_ratio, norm_dist
+
+    if dx > threshold:
+        moves.append("手向左移动")
+    elif dx < -threshold:
+        moves.append("手向右移动")
+
+    if dy > threshold:
+        moves.append("手向上移动")
+    elif dy < -threshold:
+        moves.append("手向下移动")
 
     if distance_ratio < 0.05:
-        instr.append("Move forward")
-    elif distance_ratio > 0.2:
-        instr.append("Stop. Grasp now")
-    else:
-        if dx > threshold:
-            instr.append("Left")
-        elif dx < -threshold:
-            instr.append("Right")
-        if dy > threshold:
-            instr.append("Up")
-        elif dy < -threshold:
-            instr.append("Down")
-        if not instr:
-            instr.append("Move forward slowly")
+        moves.append("向前一点")
+    elif distance_ratio > 0.25:
+        moves.append("稍微后退一点")
 
-    return " ".join(instr) if instr else "Aligned", distance_ratio
+    if not moves:
+        moves.append("继续向前一点")
+
+    return "，".join(moves), distance_ratio, norm_dist
 
 # ============ 视觉处理 ============
-def process_frame(frame: np.ndarray, target_label: str) -> Dict[str, Any]:
+def process_frame(frame: np.ndarray, target_label: str, target_selected: bool = False) -> Dict[str, Any]:
+    now = time.time()
     h, w, _ = frame.shape
     results = YOLO_MODEL(frame, verbose=False, conf=0.5)[0]
     target_info = None
@@ -169,7 +227,72 @@ def process_frame(frame: np.ndarray, target_label: str) -> Dict[str, Any]:
             }
             break
 
-    instruction, distance_ratio = generate_accessible_instruction(hand_center, target_info, h, w)
+    target_cn = target_to_cn(target_label)
+    distance_ratio = target_info["area"] if target_info else 0.0
+
+    if not target_selected:
+        instruction = "请问您需要什么？"
+        state.phase = "idle"
+        state.search_started_at = now
+        state.target_seen_at = None
+        state.grab_candidate_since = None
+        state.last_target_center = None
+    elif now < state.completed_until:
+        instruction = "任务完成，请问您需要什么？"
+    elif target_info is None:
+        if state.phase != "searching":
+            state.search_started_at = now
+            state.phase = "searching"
+        state.target_seen_at = None
+        state.grab_candidate_since = None
+        state.last_target_center = None
+        if now - state.search_started_at >= SEARCH_TIMEOUT_SEC:
+            instruction = f"视野中未发现{target_cn}，请确认物品是否在桌面上。"
+        else:
+            instruction = f"正在寻找{target_cn}。"
+    elif hand_center is None:
+        if state.target_seen_at is None:
+            state.target_seen_at = now
+        state.phase = "locked"
+        state.grab_candidate_since = None
+        if now - state.target_seen_at >= HAND_TIMEOUT_SEC:
+            instruction = "未检测到手，请稍微抬高或向前伸。"
+        else:
+            instruction = f"已锁定{target_cn}，请在胸前伸出手。"
+        state.last_target_center = target_info["center"]
+    else:
+        state.phase = "guiding"
+        state.target_seen_at = now
+        instruction, distance_ratio, norm_dist = generate_realtime_guidance(hand_center, target_info, h, w)
+
+        target_moved = False
+        if state.last_target_center is not None:
+            last_tx, last_ty = state.last_target_center
+            cur_tx, cur_ty = target_info["center"]
+            move_norm = float(np.hypot((cur_tx - last_tx) / w, (cur_ty - last_ty) / h))
+            target_moved = move_norm >= TARGET_MOVE_COMPLETE_THRESHOLD
+
+        ready_to_grasp = (instruction == "可以抓取") or (norm_dist < COMPLETE_DIST_THRESHOLD)
+
+        if ready_to_grasp:
+            if state.grab_candidate_since is None:
+                state.grab_candidate_since = now
+            if target_moved or (now - state.grab_candidate_since >= COMPLETE_HOLD_SEC):
+                instruction = "任务完成"
+                state.phase = "idle"
+                state.target_selected = False
+                state.target_label = ""
+                state.completed_until = now + 2.5
+                state.search_started_at = state.completed_until
+                state.target_seen_at = None
+                state.grab_candidate_since = None
+                state.last_target_center = None
+            else:
+                state.last_target_center = target_info["center"]
+        else:
+            state.grab_candidate_since = None
+            state.last_target_center = target_info["center"]
+
     state.current_instruction = instruction
     state.target_detected = target_info is not None
     state.hand_detected = hand_center is not None
@@ -258,7 +381,7 @@ def api_status():
     return {
         "status": "ready",
         "model": MODEL_PATH,
-        "target": state.target_label,
+        "target": state.target_label if state.target_selected else None,
         "instruction": state.current_instruction,
         "target_detected": state.target_detected,
         "hand_detected": state.hand_detected,
@@ -280,7 +403,15 @@ def api_set_target(body: Dict[str, str] = Body(...)):
     if not target:
         raise HTTPException(status_code=400, detail="target is required")
     state.target_label = target
-    return {"target": target}
+    state.target_selected = True
+    state.phase = "searching"
+    state.search_started_at = time.time()
+    state.target_seen_at = None
+    state.grab_candidate_since = None
+    state.last_target_center = None
+    state.completed_until = 0.0
+    state.current_instruction = f"正在寻找{target_to_cn(target)}。"
+    return {"target": target, "instruction": state.current_instruction}
 
 @app.post("/api/command")
 def api_command(body: Dict[str, str] = Body(...)):
@@ -289,12 +420,14 @@ def api_command(body: Dict[str, str] = Body(...)):
         raise HTTPException(status_code=400, detail="command is required")
     state.last_command = cmd
     state.target_label = cmd.lower()
+    state.target_selected = True
     speak_async(f"Target set to {state.target_label}")
     return {"command": cmd, "target": state.target_label}
 
 @app.post("/api/infer")
 async def api_infer(file: UploadFile = File(...), target: Optional[str] = None):
     target_label = target.strip() if target else state.target_label
+    target_selected = bool(target.strip()) if target else state.target_selected
     content = await file.read()
     np_arr = np.frombuffer(content, np.uint8)
     frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -302,7 +435,7 @@ async def api_infer(file: UploadFile = File(...), target: Optional[str] = None):
         raise HTTPException(status_code=400, detail="Invalid image data")
 
     t0 = time.time()
-    result = process_frame(frame, target_label)
+    result = process_frame(frame, target_label, target_selected=target_selected)
     state.last_infer_ms = round((time.time() - t0) * 1000, 2)
     return result
 
